@@ -1,29 +1,34 @@
 # core/api.py
-"""
-FastAPI wrapper for RAG pipeline.
-Exposes /ask endpoint for frontend access.
-"""
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+
 from core.rag import ask
 
-app = FastAPI(title="Telco RAG Support Assistant")
+app = FastAPI(
+    title="Telco RAG Support Assistant",
+    version="0.1.0"
+)
 
+# ---------- CORS ----------
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# -------- Request Schema --------
+# ---------- Request Schema ----------
 class AskRequest(BaseModel):
     query: str
 
-
-# -------- Response Schema --------
-class AskResponse(BaseModel):
-    answer: str
-    sources: list[str]
-
-
-# -------- API Endpoint --------
-@app.post("/ask", response_model=AskResponse)
+# ---------- API Endpoint ----------
+@app.post("/ask")
 def ask_endpoint(req: AskRequest):
-    result = ask(req.query)
-    return result
+    return ask(req.query)
+
+# ---------- Serve Frontend (MOUNT LAST) ----------
+app.mount("/", StaticFiles(directory="frontend", html=True), name="frontend")
