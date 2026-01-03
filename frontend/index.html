@@ -1,1 +1,40 @@
-<!-- Frontend entry point for chatbot UI -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>RAG Assistant</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div class="background"></div>
+
+<div class="chat-app">
+
+    <header class="chat-header">
+        <h1>🤖 RAG Assistant</h1>
+        <p>Retrieval-Augmented AI Chat</p>
+    </header>
+
+    <main class="chat-window" id="chatWindow">
+        <div class="message bot">
+            👋 Ask a question to get a grounded AI response.
+        </div>
+    </main>
+
+    <footer class="chat-input">
+        <input
+            id="userInput"
+            type="text"
+            placeholder="Type your question…"
+            autocomplete="off"
+        />
+        <button id="sendBtn">Send</button>
+    </footer>
+
+</div>
+
+<script src="script.js"></script>
+</body>
+</html>
