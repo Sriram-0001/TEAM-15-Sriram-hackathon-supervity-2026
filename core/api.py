@@ -1,5 +1,3 @@
-# core/api.py
-
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -9,7 +7,7 @@ from core.rag import ask
 
 app = FastAPI(
     title="Telco RAG Support Assistant",
-    version="0.1.0"
+    version="1.0.0"
 )
 
 # ---------- CORS ----------
@@ -21,14 +19,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------- Request Schema ----------
+# ---------- SCHEMA ----------
 class AskRequest(BaseModel):
     query: str
 
-# ---------- API Endpoint ----------
+
+# ---------- API ----------
 @app.post("/ask")
 def ask_endpoint(req: AskRequest):
     return ask(req.query)
 
-# ---------- Serve Frontend (MOUNT LAST) ----------
+
+# ---------- FRONTEND ----------
 app.mount("/", StaticFiles(directory="frontend", html=True), name="frontend")

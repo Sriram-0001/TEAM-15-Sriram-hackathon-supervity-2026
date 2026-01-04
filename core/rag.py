@@ -1,68 +1,105 @@
-# core/rag.py
 """
-Handles Retrieval-Augmented Generation (RAG):
-- Takes a user query
-- Retrieves relevant documents using FAISS
-- Uses an LLM to generate a grounded answer
-- Falls back safely if API quota/network fails
+Hybrid + Confidence-based RAG for Telecom Support
 """
-
+import os
 import numpy as np
 from sentence_transformers import SentenceTransformer
-from openai import OpenAI, OpenAIError
+import google.generativeai as genai
 
 from core.embeddings import load_faiss_index, load_documents
 
-
-# -------- CONFIG --------
-TOP_K = 3
+# ---------- CONFIG ----------
+TOP_K = 5
 SIMILARITY_THRESHOLD = 1.5
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
-LLM_MODEL = "gpt-3.5-turbo"
 
+# Confidence thresholds
+REJECT_THRESHOLD = 0.35
+ESCALATE_THRESHOLD = 0.65
 
-# -------- INIT CLIENTS --------
-client = OpenAI()  # uses OPENAI_API_KEY from env
+TELECOM_KEYWORDS = [
+    "sim", "network", "billing", "recharge",
+    "plan", "activation", "signal", "data"
+]
+
+# ---------- INIT ----------
 embedder = SentenceTransformer(EMBEDDING_MODEL)
-
 index = load_faiss_index()
-documents = load_documents()  # [{text, source_id, priority}]
+documents = load_documents()
+
+genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+llm = genai.GenerativeModel("gemini-pro")
 
 
-# -------- CORE RAG FUNCTION --------
+# ---------- CONFIDENCE ----------
+def compute_confidence(distances, retrieved_docs, query):
+    avg_distance = float(np.mean(distances))
+    vector_score = max(0, 1 - (avg_distance / 2))
+
+    keyword_hits = sum(
+        any(k in doc.lower() for k in TELECOM_KEYWORDS)
+        for doc in retrieved_docs
+    )
+    keyword_score = keyword_hits / max(1, len(retrieved_docs))
+
+    intent_score = 1.0 if any(k in query.lower() for k in TELECOM_KEYWORDS) else 0.0
+
+    return round(
+        0.5 * vector_score +
+        0.3 * keyword_score +
+        0.2 * intent_score,
+        2
+    )
+
+
+# ---------- RAG ----------
 def ask(query: str):
-    # 1. Embed query
-    query_embedding = embedder.encode([query])
-    query_embedding = np.array(query_embedding).astype("float32")
-
-    # 2. Retrieve similar documents
+    query_embedding = embedder.encode([query]).astype("float32")
     distances, indices = index.search(query_embedding, TOP_K)
 
     if len(indices[0]) == 0:
-        return escalate("No relevant documents found")
+        return reject("No relevant telecom information found")
 
-    retrieved_docs = []
-    source_ids = []
-    low_similarity = True
+    retrieved_docs = [documents[i]["text"] for i in indices[0]]
+    source_ids = [documents[i]["source_id"] for i in indices[0]]
 
-    for idx, dist in zip(indices[0], distances[0]):
-        doc = documents[idx]
-        retrieved_docs.append(doc["text"])
-        source_ids.append(doc["source_id"])
+    confidence = compute_confidence(distances[0], retrieved_docs, query)
 
-        if dist < SIMILARITY_THRESHOLD:
-            low_similarity = False
+    # ❌ OUT OF SCOPE
+    if confidence < REJECT_THRESHOLD:
+        return {
+            "answer": (
+                "I’m designed to assist only with telecom-related queries. "
+                "I can’t help with this request."
+            ),
+            "confidence": confidence,
+            "sources": []
+        }
 
-    if low_similarity:
-        return escalate("Low similarity with known issues")
+    # ⚠️ ESCALATE
+    if confidence < ESCALATE_THRESHOLD:
+        return {
+            "answer": (
+                "This request may require human assistance. "
+                "Would you like me to connect you to a support agent?"
+            ),
+            "confidence": confidence,
+            "sources": list(set(source_ids))
+        }
 
-    # 3. Build context
+    # ✅ HIGH CONFIDENCE → LLM
     context = "\n\n".join(retrieved_docs)
 
     prompt = f"""
 You are a telecom customer support assistant.
-Answer ONLY using the context below.
-If the context is insufficient, say so clearly.
+
+Give:
+1. Issue summary
+2. Reasoning (based on similar past tickets)
+3. Clear step-by-step resolution
+4. Escalation note if needed
+
+Use ONLY the context below.
 
 Context:
 {context}
@@ -71,34 +108,17 @@ Question:
 {query}
 """
 
-    # 4. TRY LLM → FALLBACK ON FAILURE
     try:
-        response = client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
-            timeout=30
-        )
-
-        answer = response.choices[0].message.content
-
-    except Exception as e:
-        # Fallback when quota / network / timeout fails
+        response = llm.generate_content(prompt)
+        answer = response.text
+    except Exception:
         answer = (
-            "Based on similar historical customer support tickets, product setup issues "
-            "are commonly caused by incomplete configuration steps or incorrect initialization. "
-            "Please verify the setup instructions and escalate to a human agent if the issue persists."
+            "Based on similar telecom issues, this problem may relate to configuration "
+            "or activation. Please verify setup steps or contact support if unresolved."
         )
 
     return {
         "answer": answer,
+        "confidence": confidence,
         "sources": list(set(source_ids))
-    }
-
-
-# -------- ESCALATION --------
-def escalate(reason: str):
-    return {
-        "answer": f"This issue requires escalation to a human support agent. ({reason})",
-        "sources": []
     }
