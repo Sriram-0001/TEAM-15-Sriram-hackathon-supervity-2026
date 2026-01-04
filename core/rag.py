@@ -1,124 +1,218 @@
 """
-Hybrid + Confidence-based RAG for Telecom Support
+Hybrid + Agentic + Confidence-based RAG for Telecom Support
+----------------------------------------------------------
+Improvements:
+- Robust query rewriting
+- Softer confidence gating
+- Clear Gemini health check
+- Better debugging
+- Reduced false rejections
 """
+
 import os
 import numpy as np
 from sentence_transformers import SentenceTransformer
-import google.generativeai as genai
+from google import genai
+
 
 from core.embeddings import load_faiss_index, load_documents
 
-# ---------- CONFIG ----------
+
+# ================= CONFIG =================
 TOP_K = 5
-SIMILARITY_THRESHOLD = 1.5
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 
-# Confidence thresholds
-REJECT_THRESHOLD = 0.35
-ESCALATE_THRESHOLD = 0.65
+REJECT_THRESHOLD = 0.25      # softer
+ESCALATE_THRESHOLD = 0.55    # softer
 
-TELECOM_KEYWORDS = [
-    "sim", "network", "billing", "recharge",
-    "plan", "activation", "signal", "data"
-]
+MAX_MEMORY = 3
 
-# ---------- INIT ----------
+
+TELECOM_KEYWORDS = {
+    "billing": ["bill", "payment", "charge", "invoice"],
+    "network": ["network", "signal", "speed", "slow", "4g", "5g", "lte", "coverage"],
+    "sim": ["sim", "activation", "swap", "port"],
+    "plan": ["plan", "recharge", "data", "pack"]
+}
+
+
+# ================= INIT =================
 embedder = SentenceTransformer(EMBEDDING_MODEL)
+
 index = load_faiss_index()
 documents = load_documents()
 
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-llm = genai.GenerativeModel("gemini-pro")
+client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
 
 
-# ---------- CONFIDENCE ----------
+
+SESSION_MEMORY = []
+
+
+# ================= UTILITIES =================
+def detect_domain(text: str) -> str:
+    text = text.lower()
+    for domain, keywords in TELECOM_KEYWORDS.items():
+        if any(k in text for k in keywords):
+            return domain
+    return "general"
+
+
+def rewrite_query(query: str) -> str:
+    """
+    Agentic query rewriting (keyword-based, not exact match)
+    """
+    q = query.lower()
+
+    if "slow" in q and ("network" in q or "internet" in q):
+        return "low mobile data speed issue"
+
+    if "no signal" in q or ("signal" in q and "not" in q):
+        return "mobile network signal not available"
+
+    if "sim" in q and ("not working" in q or "issue" in q):
+        return "sim activation or sim failure issue"
+
+    return query
+
+
 def compute_confidence(distances, retrieved_docs, query):
-    avg_distance = float(np.mean(distances))
-    vector_score = max(0, 1 - (avg_distance / 2))
+    # FAISS similarity score
+    best_distance = float(distances[0])
+    vector_score = max(0.0, 1.0 - (best_distance / 2.0))
 
-    keyword_hits = sum(
-        any(k in doc.lower() for k in TELECOM_KEYWORDS)
-        for doc in retrieved_docs
-    )
+    # Intent score (soft)
+    domain = detect_domain(query)
+    intent_score = 0.5 if domain != "general" else 0.0
+
+    # Keyword overlap score
+    keyword_hits = 0
+    for doc in retrieved_docs:
+        for group in TELECOM_KEYWORDS.values():
+            if any(k in doc.lower() for k in group):
+                keyword_hits += 1
+                break
+
     keyword_score = keyword_hits / max(1, len(retrieved_docs))
 
-    intent_score = 1.0 if any(k in query.lower() for k in TELECOM_KEYWORDS) else 0.0
+    confidence = (
+        0.6 * vector_score +
+        0.25 * intent_score +
+        0.15 * keyword_score
+    )
 
-    return round(
-        0.5 * vector_score +
-        0.3 * keyword_score +
-        0.2 * intent_score,
-        2
+    return round(confidence, 2)
+
+
+def update_memory(query, answer):
+    SESSION_MEMORY.append((query, answer))
+    if len(SESSION_MEMORY) > MAX_MEMORY:
+        SESSION_MEMORY.pop(0)
+
+
+def build_memory_context():
+    if not SESSION_MEMORY:
+        return ""
+    return "\n".join(
+        f"User: {q}\nAssistant: {a}"
+        for q, a in SESSION_MEMORY
     )
 
 
-# ---------- RAG ----------
+# ================= MAIN RAG =================
 def ask(query: str):
-    query_embedding = embedder.encode([query]).astype("float32")
+    rewritten_query = rewrite_query(query)
+    domain = detect_domain(rewritten_query)
+
+    # Embed + retrieve
+    query_embedding = embedder.encode([rewritten_query]).astype("float32")
     distances, indices = index.search(query_embedding, TOP_K)
 
     if len(indices[0]) == 0:
-        return reject("No relevant telecom information found")
+        return reject("No relevant telecom data found")
 
     retrieved_docs = [documents[i]["text"] for i in indices[0]]
     source_ids = [documents[i]["source_id"] for i in indices[0]]
 
-    confidence = compute_confidence(distances[0], retrieved_docs, query)
+    confidence = compute_confidence(distances[0], retrieved_docs, rewritten_query)
 
-    # ❌ OUT OF SCOPE
-    if confidence < REJECT_THRESHOLD:
+    print(f"[DEBUG] Query='{query}' | Rewritten='{rewritten_query}'")
+    print(f"[DEBUG] Domain={domain} | Confidence={confidence}")
+
+    # ❌ HARD REJECT (clearly non-telecom)
+    if confidence < REJECT_THRESHOLD and domain == "general":
         return {
             "answer": (
-                "I’m designed to assist only with telecom-related queries. "
-                "I can’t help with this request."
+                "I’m designed to help with telecom-related issues like "
+                "network, SIM, billing, or plans."
             ),
             "confidence": confidence,
+            "decision": "rejected",
             "sources": []
         }
 
-    # ⚠️ ESCALATE
+    # ⚠️ ESCALATE (low confidence telecom)
     if confidence < ESCALATE_THRESHOLD:
         return {
             "answer": (
-                "This request may require human assistance. "
-                "Would you like me to connect you to a support agent?"
+                f"This seems related to **{domain}**, but I’m not fully confident. "
+                "It may require human assistance. Would you like me to escalate?"
             ),
             "confidence": confidence,
+            "decision": "escalate",
+            "escalation_team": domain,
             "sources": list(set(source_ids))
         }
 
-    # ✅ HIGH CONFIDENCE → LLM
+    # ✅ HIGH CONFIDENCE → GEMINI
+    memory_context = build_memory_context()
     context = "\n\n".join(retrieved_docs)
 
     prompt = f"""
 You are a telecom customer support assistant.
 
-Give:
-1. Issue summary
-2. Reasoning (based on similar past tickets)
-3. Clear step-by-step resolution
-4. Escalation note if needed
+Conversation History:
+{memory_context}
 
-Use ONLY the context below.
-
-Context:
+Knowledge Base:
 {context}
 
-Question:
-{query}
-"""
+User Question:
+{rewritten_query}
 
+Respond with:
+1. Issue Summary
+2. Likely Cause (based on similar tickets)
+3. Step-by-step Resolution
+4. Escalation Note (if unresolved)
+"""
     try:
-        response = llm.generate_content(prompt)
-        answer = response.text
-    except Exception:
-        answer = (
-            "Based on similar telecom issues, this problem may relate to configuration "
-            "or activation. Please verify setup steps or contact support if unresolved."
+        print("[DEBUG] 🔥 Calling Gemini")
+        response = client.models.generate_content(
+            model="gemini-pro-latest",
+            contents=prompt
         )
+        answer = response.text.strip()
+    except Exception as e:
+        answer = f"LLM error: {str(e)}"
+
+
+
+    update_memory(query, answer)
 
     return {
         "answer": answer,
         "confidence": confidence,
+        "decision": "answered",
+        "domain": domain,
         "sources": list(set(source_ids))
+    }
+
+
+def reject(reason):
+    return {
+        "answer": f"I can’t assist with this request. ({reason})",
+        "confidence": 0.0,
+        "decision": "rejected",
+        "sources": []
     }
